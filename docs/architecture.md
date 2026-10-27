@@ -82,3 +82,39 @@ When a module changes how the app fits together, add a section here:
 **Risks and open questions:** cost, privacy, accuracy or safety risks, and how
 you handle them.
 ```
+
+## Module 2: Ask Copper
+
+**Summary:** A floating chat panel on the landing page that answers price,
+total and stock questions by calling four tools instead of guessing, and shows
+each step (tools on offer, thinking, tool calls, reply) as it streams in.
+
+| Piece | Where | What it does |
+|---|---|---|
+| Page / route | `app/page.tsx` | Mounts the panel and passes `isAiConfigured()` to it. No new routes |
+| Components | `components/copper/ask-copper.tsx` | Launcher, Sheet panel, the tools on/off chats, stations and tool cards. The header's `#ask` link opens it |
+| Server Action | `lib/copper/assistant/ask.ts` | `askCopper({ messages, useTools })` returns `{ progress }` at once and fills it from `result.fullStream` |
+| Tools | `lib/copper/assistant/tools.ts` | `get_products`, `get_prices`, `calculate_cost`, `check_availability` |
+| Instructions | `lib/copper/assistant/instructions.ts` | Copper's system prompt, sent only with tools on |
+| Data | `lib/copper/data/catalog.json`, `lib/copper/data/inventory.json` | Prices and colors from the catalog; stock read fresh with `readInventory()` on every call |
+| AI calls | `callStream` (module 2, feature `ask-copper`) | Gemini with thought summaries, up to 5 steps with tools on. Logged to `ai_calls` per question |
+
+**Data flow:** shopper asks → panel calls `askCopper` with its own chat's
+history → `callStream` → the model calls tools (catalog / inventory) → each
+stream part updates a `Progress` → the panel reads every update with
+`readLive()` and redraws.
+
+**Decisions and trade-offs:**
+- A Server Action returning a live value (plain promises) instead of an API
+  route, so the site stays one page (AC-1.4).
+- Tools off sends no instructions and no tools, so the comparison shows what
+  the model does from memory alone.
+- Each update is a fresh copy of the whole `Progress`, so a missed update loses
+  nothing and earlier updates never change.
+- If the model fails, the answer finishes with `status: "error"` and a short
+  apology rather than a rejected promise, so the panel always has something to
+  show.
+
+**Risks and open questions:** The tools-off chat can state invented prices as
+fact; the panel labels it "Answered without tools: may be made up". Each
+question costs a model call; `ai_calls` shows the cost and time.
