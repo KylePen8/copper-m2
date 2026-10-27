@@ -2,9 +2,15 @@
 // lib/copper/catalog.ts and stock from lib/copper/inventory.ts, so the
 // chatbot never has to make them up.
 // The contract for each tool is in specs/module-2/spec.md.
-import type { ToolSet } from "ai";
+import { tool, type ToolSet } from "ai";
 import { z } from "zod";
-import type { Plan, ProductId } from "@/lib/copper/catalog";
+import {
+  getPlans,
+  getProducts,
+  type Plan,
+  type ProductId,
+} from "@/lib/copper/catalog";
+import { readInventory } from "@/lib/copper/inventory";
 
 export type ProductList = {
   products: {
@@ -18,7 +24,12 @@ export type ProductList = {
 
 export type Prices = {
   products: { id: ProductId; name: string; priceUsd: number }[];
-  plans: { id: Plan["id"]; name: string; monthlyUsd: number; annualUsd: number }[];
+  plans: {
+    id: Plan["id"];
+    name: string;
+    monthlyUsd: number;
+    annualUsd: number;
+  }[];
 };
 
 export type CalculateCostInput = {
@@ -48,44 +59,172 @@ export type Availability =
 
 /** get_products: what Copper sells and which colors each one comes in. */
 export function listProducts(): ProductList {
-  // TODO (AC-M2.8): build this from getProducts(). It's called listProducts()
-  // because the catalog already exports a getProducts().
-  throw new Error("get_products isn't built yet");
+  return {
+    products: getProducts().map(({ id, name, type, priceUsd, colors }) => ({
+      id,
+      name,
+      type,
+      priceUsd,
+      colors,
+    })),
+  };
 }
 
 /** get_prices: every product and plan price, read from the catalog. */
 export function getPrices(): Prices {
-  // TODO (AC-M2.8): build this from getProducts() and getPlans().
-  throw new Error("get_prices isn't built yet");
+  return {
+    products: getProducts().map(({ id, name, priceUsd }) => ({
+      id,
+      name,
+      priceUsd,
+    })),
+    plans: getPlans().map(({ id, name, monthlyUsd, annualUsd }) => ({
+      id,
+      name,
+      monthlyUsd,
+      annualUsd,
+    })),
+  };
 }
 
-// TODO (AC-M2.7): replace z.any() with a schema that only accepts the
-// calculate_cost contract in spec.md.
-export const calculateCostInput: z.ZodType<CalculateCostInput> = z.any();
+const productId = z.enum(["copper-home", "copper-notes"]);
+
+export const calculateCostInput: z.ZodType<CalculateCostInput> = z.object({
+  products: z.array(productId).max(5),
+  plan: z.enum(["free", "copper-plus"]),
+  billing: z.enum(["monthly", "annual"]),
+  years: z.number().int().min(1).max(5),
+});
+
+const toCents = (usd: number) => Math.round(usd * 100) / 100;
 
 /** calculate_cost: the total cost of devices plus a plan over some years. */
 export function calculateCost(input: CalculateCostInput): CostBreakdown {
-  // TODO (AC-M2.5, AC-M2.6): do the math with prices from the catalog.
-  void input;
-  throw new Error("calculate_cost isn't built yet");
+  const products = getProducts();
+  const lines: CostBreakdown["lines"] = [];
+
+  for (const id of input.products) {
+    const product = products.find((p) => p.id === id);
+    if (!product) throw new Error(`Unknown product: ${id}`);
+    lines.push({ item: product.name, usd: toCents(product.priceUsd) });
+  }
+
+  // A plan covers the whole household, so it's counted once. Free adds nothing.
+  if (input.plan !== "free") {
+    const plan = getPlans().find((p) => p.id === input.plan);
+    if (!plan) throw new Error(`Unknown plan: ${input.plan}`);
+    const years = `${input.years} ${input.years === 1 ? "year" : "years"}`;
+    lines.push(
+      input.billing === "monthly"
+        ? {
+            item: `${plan.name}, monthly for ${years}`,
+            usd: toCents(plan.monthlyUsd * 12 * input.years),
+          }
+        : {
+            item: `${plan.name}, yearly for ${years}`,
+            usd: toCents(plan.annualUsd * input.years),
+          },
+    );
+  }
+
+  return {
+    lines,
+    totalUsd: toCents(lines.reduce((sum, line) => sum + line.usd, 0)),
+  };
 }
 
-// TODO (AC-M2.10): replace z.any() with a schema that only accepts the
-// check_availability contract in spec.md.
 export const checkAvailabilityInput: z.ZodType<CheckAvailabilityInput> =
-  z.any();
+  z.object({
+    product: productId,
+    color: z.string().optional(),
+  });
+
+function stockLevel(units: number): Stock {
+  if (units <= 0) return "backordered";
+  if (units < 10) return "low_stock";
+  return "in_stock";
+}
 
 /** check_availability: stock for one product (or one of its colors), read fresh each time. */
 export async function checkAvailability(
   input: CheckAvailabilityInput,
 ): Promise<Availability> {
-  // TODO (AC-M2.9, AC-M2.10): read the stock list with readInventory() from
-  // lib/copper/inventory.ts, every time this runs.
-  void input;
-  throw new Error("check_availability isn't built yet");
+  const product = getProducts().find((p) => p.id === input.product);
+  if (!product) {
+    return { status: "unavailable", message: "That isn't a Copper product." };
+  }
+
+  // Check the color against the catalog before stock, so a color the product
+  // doesn't come in is "not_a_color" even when stock can't be read.
+  let colors = product.colors;
+  if (input.color !== undefined) {
+    const asked = input.color.trim().toLowerCase();
+    const match = product.colors.find((c) => c.toLowerCase() === asked);
+    if (!match) {
+      return {
+        status: "not_a_color",
+        product: product.name,
+        color: input.color,
+        colors: product.colors,
+      };
+    }
+    colors = [match];
+  }
+
+  const rows = await readInventory();
+  if (rows === null) {
+    return {
+      status: "unavailable",
+      message: "Stock can't be checked right now. Please try again soon.",
+    };
+  }
+
+  // Stock rows name the product ("Copper Notes"), not its id.
+  const productRows = rows.filter((row) => row.product === product.name);
+  return {
+    status: "ok",
+    product: product.name,
+    colors: colors.flatMap((color) => {
+      const row = productRows.find(
+        (r) => r.color.toLowerCase() === color.toLowerCase(),
+      );
+      if (!row) return [];
+      const stock = stockLevel(row.units_in_stock);
+      return [
+        {
+          color,
+          stock,
+          restockDate: stock === "backordered" ? row.next_shipment : null,
+        },
+      ];
+    }),
+  };
 }
 
-// TODO (AC-M2.8): the tools the model can call, made with tool() from "ai":
-// { get_products, get_prices, calculate_cost, check_availability }, each with
-// a description and execute.
-export const copperTools: ToolSet = {};
+/** The tools the model can call. */
+export const copperTools: ToolSet = {
+  get_products: tool({
+    description:
+      "List every Copper State Labs product with its type, price and the colors it comes in (not whether they're in stock).",
+    inputSchema: z.object({}),
+    execute: async () => listProducts(),
+  }),
+  get_prices: tool({
+    description:
+      "Get the price of every Copper product and the monthly and annual price of every plan.",
+    inputSchema: z.object({}),
+    execute: async () => getPrices(),
+  }),
+  calculate_cost: tool({
+    description:
+      "Work out the total cost of some Copper devices plus a plan (counted once per household), billed monthly or annually, over 1 to 5 years.",
+    inputSchema: calculateCostInput,
+    execute: async (input) => calculateCost(input),
+  }),
+  check_availability: tool({
+    description:
+      "Check whether a Copper product is in stock today, for every color or just one, and when back-ordered colors restock.",
+    inputSchema: checkAvailabilityInput,
+    execute: async (input) => checkAvailability(input),
+  }),
+};
